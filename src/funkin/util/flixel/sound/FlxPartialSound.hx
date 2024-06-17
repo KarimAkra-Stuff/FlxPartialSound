@@ -15,6 +15,12 @@ import openfl.utils.Assets;
 
 using StringTools;
 
+#if sys
+import sys.io.File;
+import sys.io.FileInput;
+import sys.io.FileSeek;
+#end
+
 class FlxPartialSound
 {
 	/**
@@ -52,7 +58,7 @@ class FlxPartialSound
 			return promise;
 		}
 
-		#if web
+		#if (html || js)
 		requestContentLength(path).onComplete(function(contentLength:Int)
 		{
 			var startByte:Int = Std.int(contentLength * rangeStart);
@@ -102,77 +108,69 @@ class FlxPartialSound
 		});
 
 		return promise;
-		#else
-		if (!Assets.exists(path))
-		{
+		#elseif sys
+		if (!sys.FileSystem.exists(path)) {
 			FlxG.log.warn("Could not find audio file for partial playback: " + path);
 			return null;
 		}
 
+		var fileInput = sys.io.File.read(path);
+		var fileStat = sys.FileSystem.stat(path);
 		var byteNum:Int = 0;
 
-		// on native, it will always be an ogg file, although eventually we might want to add WAV?
-		Assets.loadBytes(path).onComplete(function(data:openfl.utils.ByteArray)
+		// on sys, it will always be an ogg file, although eventually we might want to add WAV?
+
+		switch (Path.extension(path))
 		{
-			var input = new BytesInput(data);
-
-			@:privateAccess
-			var size = input.b.length;
-
-			switch (Path.extension(path))
-			{
-				case "ogg":
-					var oggBytesAsync = new Future<Bytes>(function()
+			case "ogg":
+				var oggBytesAsync = new Future<Bytes>(function()
+				{
+					var oggBytesIntro = Bytes.alloc(16 * 400);
+					while (byteNum < 16 * 400)
 					{
-						var oggBytesIntro = Bytes.alloc(16 * 400);
-						while (byteNum < 16 * 400)
+						oggBytesIntro.set(byteNum, fileInput.readByte());
+						byteNum++;
+					}
+					return cleanOggBytes(oggBytesIntro);
+				}, true);
+
+				oggBytesAsync.onComplete(function(oggBytesIntro:Bytes)
+				{
+					var oggRangeMin:Float = rangeStart * fileStat.size;
+					var oggRangeMax:Float = rangeEnd * fileStat.size;
+					var oggBytesFull = Bytes.alloc(Std.int(oggRangeMax - oggRangeMin));
+
+					byteNum = 0;
+					fileInput.seek(Std.int(oggRangeMin), FileSeek.SeekBegin);
+
+					var fullBytesAsync = new Future<Bytes>(function()
+					{
+						while (byteNum < oggRangeMax - oggRangeMin)
 						{
-							oggBytesIntro.set(byteNum, input.readByte());
+							oggBytesFull.set(byteNum, fileInput.readByte());
 							byteNum++;
 						}
-						return cleanOggBytes(oggBytesIntro);
+						return cleanOggBytes(oggBytesFull);
 					}, true);
 
-					oggBytesAsync.onComplete(function(oggBytesIntro:Bytes)
+					fullBytesAsync.onComplete(function(fullAssOgg:Bytes)
 					{
-						var oggRangeMin:Float = rangeStart * size;
-						var oggRangeMax:Float = rangeEnd * size;
-						var oggBytesFull = Bytes.alloc(Std.int(oggRangeMax - oggRangeMin));
+						var oggFullBytes = Bytes.alloc(oggBytesIntro.length + fullAssOgg.length);
+						oggFullBytes.blit(0, oggBytesIntro, 0, oggBytesIntro.length);
+						oggFullBytes.blit(oggBytesIntro.length, fullAssOgg, 0, fullAssOgg.length);
+						fileInput.close();
 
-						byteNum = 0;
+						var audioBuffer:AudioBuffer = parseBytesOgg(oggFullBytes, true);
 
-						input.position = Std.int(oggRangeMin);
-
-						var fullBytesAsync = new Future<Bytes>(function()
-						{
-							while (byteNum < oggRangeMax - oggRangeMin)
-							{
-								oggBytesFull.set(byteNum, input.readByte());
-								byteNum++;
-							}
-
-							return cleanOggBytes(oggBytesFull);
-						}, true);
-
-						fullBytesAsync.onComplete(function(fullAssOgg:Bytes)
-						{
-							var oggFullBytes = Bytes.alloc(oggBytesIntro.length + fullAssOgg.length);
-							oggFullBytes.blit(0, oggBytesIntro, 0, oggBytesIntro.length);
-							oggFullBytes.blit(oggBytesIntro.length, fullAssOgg, 0, fullAssOgg.length);
-							input.close();
-
-							var audioBuffer:AudioBuffer = parseBytesOgg(oggFullBytes, true);
-
-							var sndShit = Sound.fromAudioBuffer(audioBuffer);
-							Assets.cache.setSound(path + ".partial-" + rangeStart + "-" + rangeEnd, sndShit);
-							promise.complete(sndShit);
-						});
+						var sndShit = Sound.fromAudioBuffer(audioBuffer);
+						Assets.cache.setSound(path + ".partial-" + rangeStart + "-" + rangeEnd, sndShit);
+						promise.complete(sndShit);
 					});
+				});
 
-				default:
-					promise.error("Unsupported file type: " + Path.extension(path));
-			}
-		});
+			default:
+				promise.error("Unsupported file type: " + Path.extension(path));
+		}
 
 		// trace(fileInput.readAll());
 
